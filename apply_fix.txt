@@ -1,0 +1,256 @@
+=== CRITICAL FIX: Prevent Wrong Defenders Being Destroyed ===
+
+THE PROBLEM:
+- Array indices (DefIdx) become invalid when defenders die
+- Enemy targets Defender #1, but Defender #0 dies first
+- Now index #1 points to a DIFFERENT defender
+- Wrong defender gets destroyed
+
+THE SOLUTION:
+Use the Prop object as identifier instead of array index
+
+=== STEP-BY-STEP CHANGES ===
+
+STEP 1: Modify FindNextDefenderToAttack to return defense_unit (not tuple)
+------------------------------------------------------------------------
+
+FIND THIS:
+FindNextDefenderToAttack(State:player_state, EnemyChar:fort_character) : ?tuple(int, defense_unit) =
+
+REPLACE WITH:
+FindNextDefenderToAttack(State:player_state, EnemyChar:fort_character) : ?defense_unit =
+
+THEN IN THE SAME FUNCTION, FIND:
+    var ClosestDefIdx : int = -1
+    var ClosestDist : float = 999999.0
+    var ClosestDef : ?defense_unit = false
+    
+    for (DefIdx := 0..State.Defenses.Length - 1):
+        if (DefIdx >= 0, DefIdx < State.Defenses.Length):
+            if (Def := State.Defenses[DefIdx]):
+                if (Def.Prop.IsValid[], Def.Health > 0.0):
+                    DefPos := Def.Prop.GetTransform().Translation
+                    Dist := Distance(EnemyPos, DefPos)
+                    
+                    if (Dist < ClosestDist):
+                        set ClosestDefIdx = DefIdx
+                        set ClosestDist = Dist
+                        set ClosestDef = option{Def}
+    
+    if (Def := ClosestDef?, ClosestDefIdx >= 0):
+        return option{(ClosestDefIdx, Def)}
+
+REPLACE WITH:
+    var ClosestDef : ?defense_unit = false
+    var ClosestDist : float = 999999.0
+    
+    for (DefIdx := 0..State.Defenses.Length - 1):
+        if (DefIdx >= 0, DefIdx < State.Defenses.Length):
+            if (Def := State.Defenses[DefIdx]):
+                if (Def.Prop.IsValid[], Def.Health > 0.0):
+                    DefPos := Def.Prop.GetTransform().Translation
+                    Dist := Distance(EnemyPos, DefPos)
+                    
+                    if (Dist < ClosestDist):
+                        set ClosestDist = Dist
+                        set ClosestDef = option{Def}
+    
+    return ClosestDef
+
+
+STEP 2: Modify MoveEnemyNPC to use defense_unit
+------------------------------------------------------------------------
+
+FIND THIS in MoveEnemyNPC:
+        MaybeDefenderInfo := FindNextDefenderToAttack(State, EnemyChar)
+        
+        if (DefenderInfo := MaybeDefenderInfo?):
+            DefIdx := DefenderInfo(0)
+            Def := DefenderInfo(1)
+            
+            Print("🎯 [ID:{EnemyID}] TARGETING DEFENDER AT INDEX {DefIdx}")
+            
+            AttackSingleDefender(OwnerAgent, EnemyAgent, EnemyID, DefIdx, State, Nav, EnemyChar, Anim)
+
+REPLACE WITH:
+        MaybeDefender := FindNextDefenderToAttack(State, EnemyChar)
+        
+        if (Defender := MaybeDefender?):
+            Print("🎯 [ID:{EnemyID}] TARGETING DEFENDER")
+            
+            AttackDefenderByProp(OwnerAgent, EnemyAgent, EnemyID, Defender, State, Nav, EnemyChar, Anim)
+
+
+STEP 3: Rename AttackSingleDefender to AttackDefenderByProp
+------------------------------------------------------------------------
+
+FIND:
+AttackSingleDefender(OwnerAgent:agent, EnemyAgent:agent, EnemyID:int, DefIdx:int, State:player_state, Nav:navigatable, EnemyChar:fort_character, Anim:play_animation_controller)<suspends>:void =
+
+REPLACE WITH:
+AttackDefenderByProp(OwnerAgent:agent, EnemyAgent:agent, EnemyID:int, TargetDefender:defense_unit, State:player_state, Nav:navigatable, EnemyChar:fort_character, Anim:play_animation_controller)<suspends>:void =
+
+
+STEP 4: Inside AttackDefenderByProp, use Prop instead of DefIdx
+------------------------------------------------------------------------
+
+AT THE START OF AttackDefenderByProp, FIND:
+    if (OP := player[OwnerAgent], not OP.IsActive[]): 
+        return
+    
+    # Verify defender still exists
+    if (DefIdx < 0 or DefIdx >= State.Defenses.Length):
+        return
+    
+    if (Def := State.Defenses[DefIdx]):
+        if (not Def.Prop.IsValid[] or Def.Health <= 0.0):
+            return
+        
+        DefPos := Def.Prop.GetTransform().Translation
+
+REPLACE WITH:
+    if (OP := player[OwnerAgent], not OP.IsActive[]): 
+        return
+    
+    # Use Prop as stable identifier
+    TargetProp := TargetDefender.Prop
+    
+    if (not TargetProp.IsValid[] or TargetDefender.Health <= 0.0):
+        return
+    
+    DefPos := TargetProp.GetTransform().Translation
+
+
+STEP 5: Update defender search in attack position logic
+------------------------------------------------------------------------
+
+FIND (in attack position calculation):
+        if (Def.DefenderTypeIndex = -1):
+
+REPLACE WITH:
+        if (TargetDefender.DefenderTypeIndex = -1):
+
+AND FIND:
+                        if (Spot.PlacedDefenderArrayIndex = DefIdx):
+
+REPLACE WITH:
+                        if (PlacedDef := Spot.PlacedDefender?):
+                            if (PlacedDef.Prop = TargetProp):
+
+
+STEP 6: Use Prop hash for animation key
+------------------------------------------------------------------------
+
+FIND (before the attack loop):
+    Print("⚔️ [ID:{EnemyID}] STARTING ATTACK LOOP ON DEFENDER {DefIdx}")
+
+REPLACE WITH:
+    # ✅ Use Prop hashcode as animation key (stable)
+    var AnimKey : int = 0
+    if (PropHash := TargetProp.GetHashCode[]):
+        set AnimKey = PropHash
+    
+    Print("⚔️ [ID:{EnemyID}] STARTING ATTACK LOOP (AnimKey:{AnimKey})")
+
+
+STEP 7: Update attack loop to check Prop validity
+------------------------------------------------------------------------
+
+FIND (in attack loop):
+            # Check if defender is still valid
+            if (not Def.Prop.IsValid[]):
+
+REPLACE WITH:
+            # Check if THIS SPECIFIC defender is still valid
+            if (not TargetProp.IsValid[]):
+
+
+STEP 8: Search for defender by Prop each frame
+------------------------------------------------------------------------
+
+FIND (in attack loop):
+            # Attack logic
+            if (DefIdx >= 0 and DefIdx < State.Defenses.Length):
+                if (CurrentDef := State.Defenses[DefIdx]):
+
+REPLACE WITH:
+            # ✅ Find THIS defender in array by Prop
+            var FoundDefenderIndex : int = -1
+            var FoundDefender : ?defense_unit = false
+            
+            for (SearchIdx := 0..State.Defenses.Length - 1):
+                if (SearchIdx >= 0, SearchIdx < State.Defenses.Length):
+                    if (CheckDef := State.Defenses[SearchIdx]):
+                        if (CheckDef.Prop = TargetProp):
+                            set FoundDefenderIndex = SearchIdx
+                            set FoundDefender = option{CheckDef}
+                            break
+            
+            if (FoundDef := FoundDefender?, FoundDefenderIndex >= 0):
+
+
+STEP 9: Use AnimKey instead of DefIdx for animations
+------------------------------------------------------------------------
+
+FIND:
+                            AnimMgr.StartAnimation(Anim, TheAnim, Atk.AttackInterval, DefIdx)
+
+REPLACE WITH:
+                            AnimMgr.StartAnimation(Anim, TheAnim, Atk.AttackInterval, AnimKey)
+
+
+STEP 10: Update state with FoundDefenderIndex
+------------------------------------------------------------------------
+
+FIND all instances of:
+                        if (set State.Defenses[DefIdx] = defense_unit{
+
+REPLACE WITH:
+                        if (set State.Defenses[FoundDefenderIndex] = defense_unit{
+
+
+STEP 11: Fix defender cleanup to use Prop
+------------------------------------------------------------------------
+
+FIND:
+                            if (DefIdx < State.Defenses.Length):
+                                if (CheckDef := State.Defenses[DefIdx]):
+                                    CheckDef.Prop.Dispose()
+                                    
+                                    for (SIdx := 0..State.Config.DefensePlacementSpots.Length-1):
+                                        if (OSpot := State.Config.DefensePlacementSpots[SIdx]):
+                                            if (OSpot.PlacedDefenderArrayIndex = DefIdx):
+                                                CleanupPlacementSpot(OSpot)
+
+REPLACE WITH:
+                            # ✅ Dispose THIS specific prop
+                            FoundDef.Prop.Dispose()
+                            
+                            # ✅ Cleanup spot by matching Prop
+                            for (SIdx := 0..State.Config.DefensePlacementSpots.Length-1):
+                                if (OSpot := State.Config.DefensePlacementSpots[SIdx]):
+                                    if (PlacedDef := OSpot.PlacedDefender?):
+                                        if (PlacedDef.Prop = TargetProp):
+                                            CleanupPlacementSpot(OSpot)
+
+
+STEP 12: Handle case where defender not in array
+------------------------------------------------------------------------
+
+ADD at the end of the "if (FoundDef := FoundDefender?, FoundDefenderIndex >= 0)" block:
+        else:
+            # Defender not found in array (already removed)
+            Print("⚠️ [ID:{EnemyID}] DEFENDER NO LONGER IN ARRAY")
+            return
+
+
+=== SUMMARY ===
+
+These changes ensure:
+✅ Defenders are identified by their Prop object (stable reference)
+✅ Array index changes won't affect targeting
+✅ Only the correct defender gets destroyed
+✅ Animation keys are stable (based on Prop hash, not index)
+✅ King animations won't stack
+
+The core principle: Never use array indices as identifiers when the array can change!
